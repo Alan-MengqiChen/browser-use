@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Literal
 
@@ -271,6 +271,10 @@ class AgentState(BaseModel):
 
 	# Loop detection state
 	loop_detector: ActionLoopDetector = Field(default_factory=ActionLoopDetector)
+
+	# Day 1: Frontier
+	frontier_universe: dict[str, str] = field(default_factory=dict)
+	frontier_visited: set[str] = field(default_factory=set)
 
 
 @dataclass

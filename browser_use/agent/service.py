@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urldefrag, urlparse
 
 if TYPE_CHECKING:
 	from browser_use.skills.views import Skill
@@ -611,6 +611,132 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug(f'Could not parse output schema: {e}')
 
 		return task
+
+	def _canon_url(self, base_url: str, href: str) -> str | None:
+		if not href:
+			return None
+		href = href.strip()
+		if href.startswith("#") or href.lower().startswith("javascript:"):
+			return None			
+		abs_url = urljoin(base_url, href)
+		abs_url, _ = urldefrag(abs_url)
+		return abs_url
+
+	def _extract_frontier_entries(
+		self,
+		selector_map: dict[int, Any],
+		base_url: str,
+	) -> dict[str, str]:
+		"""
+		Day1.1 frontier extraction (language-agnostic, structure-based denoising):
+		- Visible
+		- Clickable
+		- Has href (not mailto/tel/resource files)
+		- Short text that looks like an entry label
+		- Same domain
+		- Not inside header/nav/footer regions (checked via ancestor tags/roles)
+		"""
+		entries: dict[str, str] = {}
+
+		try:
+			base_netloc = urlparse(base_url).netloc
+		except Exception:
+			base_netloc = ""
+
+		# Structural containers commonly used for global navigation / footer
+		BAD_ANCESTOR_TAGS = {"footer", "header", "nav"}
+		BAD_ANCESTOR_ROLES = {"navigation", "banner", "contentinfo"}  # ARIA roles for nav/header/footer
+
+		# Non-navigational href prefixes
+		BAD_HREF_PREFIXES = ("mailto:", "tel:", "javascript:")
+
+		# Resource file extensions (not page navigation)
+		BAD_EXTS = (
+			".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+			".zip", ".rar", ".7z", ".doc", ".docx", ".xls", ".xlsx",
+			".ppt", ".pptx",
+		)
+
+		def has_bad_ancestor(node: Any, max_depth: int = 8) -> bool:
+			"""Return True if the node is inside header/nav/footer-like containers."""
+			cur = node.parent_node
+			depth = 0
+			while cur is not None and depth < max_depth:
+				tag = (cur.tag_name or "").lower()
+				role = (cur.attributes.get("role") or "").lower()
+				if tag in BAD_ANCESTOR_TAGS or role in BAD_ANCESTOR_ROLES:
+					return True
+				cur = cur.parent_node
+				depth += 1
+			return False
+
+		def looks_like_label(text: str) -> bool:
+			"""
+			Check whether text looks like a meaningful navigation label:
+			- Not empty
+			- Reasonable length
+			- Contains at least one alphanumeric or CJK character
+			"""
+			t = (text or "").strip()
+			if not t:
+				return False
+			if len(t) < 2:      # Too short (e.g. ">", "·", "1")
+				return False
+			if len(t) > 40:     # Too long for a navigation label
+				return False
+			for ch in t:
+				if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"):
+					return True
+			return False
+
+		for node in selector_map.values():
+			if node.is_visible is False:
+				continue
+			if getattr(node.node_type, "name", "") != "ELEMENT_NODE":
+				continue
+
+			tag = node.tag_name
+			role = (node.attributes.get("role") or "").lower()
+			clickish = tag in {"a", "button"} or node.has_js_click_listener or role in {"link", "button"}
+			if not clickish:
+				continue
+
+			href = (node.attributes.get("href") or "").strip()
+			if not href:
+				continue
+			if href.startswith("#"):
+				continue
+			href_l = href.lower()
+			if href_l.startswith(BAD_HREF_PREFIXES):
+				continue
+
+			canon = self._canon_url(base_url, href)
+			if not canon:
+				continue
+
+			# Same-domain check to avoid external links
+			try:
+				if base_netloc and urlparse(canon).netloc and urlparse(canon).netloc != base_netloc:
+					continue
+			except Exception:
+				pass
+
+			# Filter out resource file links (pdf/images/office files)
+			canon_l = canon.lower()
+			if any(canon_l.endswith(ext) for ext in BAD_EXTS):
+				continue
+
+			# Exclude links inside header/nav/footer containers
+			if has_bad_ancestor(node):
+				continue
+
+			text = (node.get_meaningful_text_for_llm() or "").strip()
+			if not looks_like_label(text):
+				continue
+
+			entries[canon] = text
+
+		return entries
 
 	@property
 	def logger(self) -> logging.Logger:
@@ -2716,20 +2842,77 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				time_end = time.time()
 				time_elapsed = time_end - time_start
 
+				# --- Day1: Frontier tracking (no task keys) ---
+				if not hasattr(self.state, "frontier_universe"):
+					self.state.frontier_universe = {}  # canon_url -> label
+				if not hasattr(self.state, "frontier_visited"):
+					self.state.frontier_visited = set()  # canon_url
+
+				try:
+					current_url = await self.browser_session.get_current_page_url()
+
+					dom_state = None
+					if self.browser_session._cached_browser_state_summary is not None:
+						dom_state = self.browser_session._cached_browser_state_summary.dom_state
+
+					if dom_state is not None and getattr(dom_state, "selector_map", None) is not None:
+						selector_map = dict(dom_state.selector_map)
+						new_entries = self._extract_frontier_entries(selector_map, current_url)
+						self.state.frontier_universe.update(new_entries)
+
+					cur = self._canon_url(current_url, current_url) or current_url
+					self.state.frontier_visited.add(cur)
+
+				except Exception as e:
+					self.logger.debug(f"Frontier tracking skipped: {e}")
+
 				if result.error:
 					await self._demo_mode_log(
 						f'Action "{action_name}" failed: {result.error}',
 						'error',
 						{'action': action_name, 'step': self.state.n_steps},
 					)
+
 				elif result.is_done:
-					completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
-					level = 'success' if result.success is not False else 'warning'
-					await self._demo_mode_log(
-						completion_text,
-						level,
-						{'action': action_name, 'step': self.state.n_steps},
-					)
+					# --- Day1: frontier-aware stop (no task keys) ---
+					# 只拦截 success=True 的 done
+					if result.success is True:
+						universe = getattr(self.state, "frontier_universe", {})
+						visited = getattr(self.state, "frontier_visited", set())
+
+						if universe:
+							missing = [u for u in universe.keys() if u not in visited]
+
+							if missing:
+								# 撤销 done（关键：不要设置 error，否则 multi_act 会 break）
+								result.is_done = False
+								result.success = False
+								result.error = None
+
+								sample = missing[:10]
+								sample_pairs = [(universe[u], u) for u in sample]
+
+								result.long_term_memory = (
+									(result.long_term_memory or "")
+									+ f"\nJUDGE: Frontier not exhausted ({len(missing)} unvisited entries). "
+									  f"Continue exploring. Sample: {sample_pairs}"
+								)
+
+								await self._demo_mode_log(
+									f"Frontier not exhausted, continuing. Missing sample: {sample_pairs}",
+									"warning",
+									{"action": action_name, "step": self.state.n_steps},
+								)
+
+					# 原始 done 行为（只有没被撤销时才会执行）
+					if result.is_done:
+						completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
+						level = 'success' if result.success is not False else 'warning'
+						await self._demo_mode_log(
+							completion_text,
+							level,
+							{'action': action_name, 'step': self.state.n_steps},
+						)
 
 				results.append(result)
 
