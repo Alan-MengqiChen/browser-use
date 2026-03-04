@@ -2875,7 +2875,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 				elif result.is_done:
 					# --- Day1: frontier-aware stop (no task keys) ---
-					# 只拦截 success=True 的 done
 					if result.success is True:
 						universe = getattr(self.state, "frontier_universe", {})
 						visited = getattr(self.state, "frontier_visited", set())
@@ -2884,7 +2883,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 							missing = [u for u in universe.keys() if u not in visited]
 
 							if missing:
-								# 撤销 done（关键：不要设置 error，否则 multi_act 会 break）
 								result.is_done = False
 								result.success = False
 								result.error = None
