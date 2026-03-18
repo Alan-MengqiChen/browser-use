@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from urllib.parse import urlparse
 
+from browser_use.agent.unit_candidate_extractor import UnitCandidateExtractor
+from browser_use.agent.structure_clusterer import StructureClusterer
+from browser_use.agent.candidate_validator import CandidateValidator
+from browser_use.agent.coverage_scheduler import CoverageScheduler
+from browser_use.agent.completion_policy import CompletionPolicy
+from browser_use.agent.llm_unit_validator import LLMUnitValidator
+from browser_use.agent.work_unit_models import PageKind, CandidateStatus, WorkUnitStatus
+
 if TYPE_CHECKING:
 	from browser_use.skills.views import Skill
 
@@ -422,6 +430,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Initialize state
 		self.state = injected_agent_state or AgentState()
+		self.unit_candidate_extractor = UnitCandidateExtractor()
+		self.structure_clusterer = StructureClusterer()
+		self.candidate_validator = CandidateValidator()
+		self.coverage_scheduler = CoverageScheduler()
+		self.completion_policy = CompletionPolicy()
+		self.llm_unit_validator = LLMUnitValidator()
 
 		# Configure loop detector window size from settings
 		self.state.loop_detector.window_size = self.settings.loop_detection_window
@@ -1112,6 +1126,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		await self._maybe_compact_messages(step_info)
 
+		work_unit_description = self._render_work_unit_description()
+
 		self._message_manager.create_state_messages(
 			browser_state_summary=browser_state_summary,
 			model_output=self.state.last_model_output,
@@ -1123,6 +1139,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			available_file_paths=self.available_file_paths,  # Always pass current available_file_paths
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
+			work_unit_description=work_unit_description,
 			skip_state_update=True,
 		)
 
@@ -2673,6 +2690,174 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			await self.close()
 
+	async def _refresh_work_unit_state(self) -> None:
+		try:
+			current_url = await self.browser_session.get_current_page_url()
+			self.state.work_units.current_url = current_url
+
+			dom_state = None
+			if self.browser_session._cached_browser_state_summary is not None:
+				dom_state = self.browser_session._cached_browser_state_summary.dom_state
+
+			selector_map = {}
+			if dom_state is not None and getattr(dom_state, "selector_map", None) is not None:
+				selector_map = dict(dom_state.selector_map)
+
+			self.state.work_units.page_kind = self._detect_page_kind(selector_map)
+
+			if self.state.work_units.page_kind == PageKind.HUB:
+				self.state.work_units.hub_pages.add(current_url)
+				if self.state.work_units.preferred_hub_url is None:
+					self.state.work_units.preferred_hub_url = current_url
+
+				candidates = self.unit_candidate_extractor.extract(selector_map, current_url)
+				clusters = self.structure_clusterer.cluster(candidates)
+				ranked = self.structure_clusterer.rank_clusters(clusters)
+
+				discovered_labels = []
+
+				for cluster_id, items, _score in ranked[:2]:
+					for candidate in items:
+						if candidate.candidate_id not in self.state.work_units.candidates:
+							self.state.work_units.candidates[candidate.candidate_id] = candidate
+							discovered_labels.append(candidate.label)
+
+				self.state.work_units.last_discovered_labels = discovered_labels[:20]
+				if discovered_labels:
+					self.state.work_units.last_discovery_step = self.state.n_steps
+
+			self.logger.info(f"[WorkUnits] {self.state.work_units.summary()}")
+			if self.state.work_units.last_discovered_labels:
+				self.logger.info(
+					f"[WorkUnits] last discovered sample: {self.state.work_units.last_discovered_labels[:5]}"
+				)
+
+		except Exception as e:
+			self.logger.debug(f"[WorkUnits] refresh skipped: {e}")
+
+	def _detect_page_kind(self, selector_map) -> PageKind:
+		candidates = self.unit_candidate_extractor.extract(selector_map, self.state.work_units.current_url or "")
+		clusters = self.structure_clusterer.cluster(candidates)
+		ranked = self.structure_clusterer.rank_clusters(clusters)
+
+		if ranked:
+			return PageKind.HUB
+
+		return PageKind.UNKNOWN
+
+	def _render_work_unit_description(self) -> str:
+		try:
+			state = self.state.work_units
+
+			lines = []
+			lines.append(f"page_kind={state.page_kind.value}")
+			lines.append(f"current_url={state.current_url or '-'}")
+			lines.append(f"hub_url={state.preferred_hub_url or '-'}")
+			lines.append(f"active_unit={state.active_unit_id or '-'}")
+			lines.append(f"validating_candidate={state.validating_candidate_id or '-'}")
+
+			lines.append(f"total_units={state.total_units()}")
+			lines.append(f"pending_units={state.pending_units()}")
+			lines.append(f"unresolved_candidates={len(state.unresolved_candidate_ids())}")
+
+			# pending units sample
+			pending_ids = state.pending_unit_ids()[:5]
+			if pending_ids:
+				lines.append("pending_sample:")
+				for uid in pending_ids:
+					u = state.units[uid]
+					lines.append(f"- {u.label}")
+
+			# candidate sample
+			candidate_ids = state.unresolved_candidate_ids()[:5]
+			if candidate_ids:
+				lines.append("candidate_sample:")
+				for cid in candidate_ids:
+					c = state.candidates[cid]
+					lines.append(f"- {c.label}")
+
+			return "\n".join(lines)
+
+		except Exception as e:
+			return f"work_unit_render_error: {e}"
+	
+	def _get_validator_llm(self):
+		if getattr(self.settings, "page_extraction_llm", None) is not None:
+			return self.settings.page_extraction_llm
+		return self.llm
+	
+	async def _maybe_validate_candidate_with_llm(self) -> None:
+		candidate_id = self.state.work_units.validating_candidate_id
+
+		self.logger.info(
+			f"[WorkUnits] entering llm validation for candidate={candidate_id or '-'}"
+		)
+		if not candidate_id:
+			return
+
+		candidate = self.state.work_units.candidates.get(candidate_id)
+		if candidate is None:
+			self.state.work_units.validating_candidate_id = None
+			return
+
+		# Only validate unresolved candidates
+		if candidate.status != CandidateStatus.CANDIDATE:
+			self.state.work_units.validating_candidate_id = None
+			return
+
+		llm = self._get_validator_llm()
+		if llm is None:
+			return
+
+		try:
+			result = await self.llm_unit_validator.validate_candidate_transition(
+				llm=llm,
+				task=self.task,
+				state=self.state.work_units,
+				candidate_id=candidate_id,
+			)
+
+			confirmed = self.llm_unit_validator.apply_validation_result(
+				state=self.state.work_units,
+				candidate_id=candidate_id,
+				result=result,
+				current_step=self.state.n_steps,
+			)
+
+			if confirmed:
+				self.logger.info(
+					f"[WorkUnits] candidate confirmed as unit: {candidate.label} | reason={result.get('reason', '-')}"
+				)
+				self.state.work_units.active_unit_id = candidate_id
+				if candidate_id in self.state.work_units.units:
+					self.state.work_units.units[candidate_id].status = WorkUnitStatus.IN_PROGRESS
+			else:
+				self.logger.info(
+					f"[WorkUnits] candidate rejected: {candidate.label} | reason={result.get('reason', '-')}"
+				)
+
+		except Exception as e:
+			self.logger.warning(f"[WorkUnits] LLM candidate validation failed: {e}")
+
+		finally:
+			self.state.work_units.validating_candidate_id = None
+
+	def _inject_scheduler_hint(self, result) -> None:
+		try:
+			decision = self.coverage_scheduler.choose(self.state.work_units)
+
+			if decision.mode == "validate_candidate" and decision.target_candidate_id:
+				self.state.work_units.validating_candidate_id = decision.target_candidate_id
+				self.logger.info(
+					f"[WorkUnits] set validating_candidate={decision.target_candidate_id} "
+					f"label={decision.target_label or '-'}"
+				)
+
+			hint = self.coverage_scheduler.render_hint(self.state.work_units, decision)
+			result.long_term_memory = ((result.long_term_memory or "") + "\n" + hint).strip()
+		except Exception as e:
+			self.logger.debug(f"[WorkUnits] scheduler hint injection skipped: {e}")
+
 	@observe_debug(ignore_input=True, ignore_output=True)
 	@time_execution_async('--multi_act')
 	async def multi_act(self, actions: list[ActionModel]) -> list[ActionResult]:
@@ -2725,6 +2910,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 				# Capture pre-action state for runtime page-change detection
 				pre_action_url = await self.browser_session.get_current_page_url()
+				try:
+					dom_state = None
+					if self.browser_session._cached_browser_state_summary is not None:
+						dom_state = self.browser_session._cached_browser_state_summary.dom_state
+					selector_map = {}
+					if dom_state is not None and getattr(dom_state, "selector_map", None) is not None:
+						selector_map = dict(dom_state.selector_map)
+
+					self.state.work_units.last_pre_action_snapshot = self.candidate_validator.snapshot_from_state(
+						self.browser_session._cached_browser_state_summary,
+						selector_map,
+					)
+				except Exception:
+					self.state.work_units.last_pre_action_snapshot = None
 				pre_action_focus = self.browser_session.agent_focus_target_id
 
 				result = await self.tools.act(
@@ -2737,20 +2936,83 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					extraction_schema=self.extraction_schema,
 				)
 
+				# --- Work-unit perception refresh ---
+				await self._refresh_work_unit_state()
+
+				try:
+					dom_state = None
+					if self.browser_session._cached_browser_state_summary is not None:
+						dom_state = self.browser_session._cached_browser_state_summary.dom_state
+					selector_map = {}
+					if dom_state is not None and getattr(dom_state, "selector_map", None) is not None:
+						selector_map = dict(dom_state.selector_map)
+
+					self.state.work_units.last_post_action_snapshot = self.candidate_validator.snapshot_from_state(
+						self.browser_session._cached_browser_state_summary,
+						selector_map,
+					)
+				except Exception:
+					self.state.work_units.last_post_action_snapshot = None
+
+				await self._maybe_validate_candidate_with_llm()
+				self._inject_scheduler_hint(result)
+
 				if result.error:
+					if self.state.work_units.active_unit_id and self.state.work_units.active_unit_id in self.state.work_units.units:
+						unit = self.state.work_units.units[self.state.work_units.active_unit_id]
+						unit.status = WorkUnitStatus.FAILED_RETRYABLE
+						unit.retry_count += 1
+						unit.last_error = result.error
+
+					if self.state.work_units.validating_candidate_id:
+						cid = self.state.work_units.validating_candidate_id
+						if cid in self.state.work_units.candidates:
+							self.state.work_units.candidates[cid].status = CandidateStatus.REJECTED
+						self.state.work_units.validating_candidate_id = None
+
 					await self._demo_mode_log(
 						f'Action "{action_name}" failed: {result.error}',
 						'error',
 						{'action': action_name, 'step': self.state.n_steps},
 					)
 				elif result.is_done:
-					completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
-					level = 'success' if result.success is not False else 'warning'
-					await self._demo_mode_log(
-						completion_text,
-						level,
-						{'action': action_name, 'step': self.state.n_steps},
+					decision = self.completion_policy.evaluate(
+						state=self.state.work_units,
+						result_success=result.success,
+						consecutive_failures=self.state.consecutive_failures,
 					)
+
+					if not decision.allow_done:
+						result.is_done = False
+						result.success = False
+						result.error = None
+						result.long_term_memory = (
+							(result.long_term_memory or "")
+							+ f"\nJUDGE: {decision.reason}. "
+							  f"Continue exploring. "
+							  f"next_label={decision.next_label or '-'}"
+						)
+
+						await self._demo_mode_log(
+							f"Work-unit coverage blocked completion. {decision.reason}. "
+							f"next_label={decision.next_label or '-'}",
+							"warning",
+							{"action": action_name, "step": self.state.n_steps},
+						)
+
+					if result.is_done:
+						if result.success is True and self.state.work_units.active_unit_id:
+							if self.state.work_units.active_unit_id in self.state.work_units.units:
+								self.state.work_units.units[self.state.work_units.active_unit_id].status = WorkUnitStatus.DONE
+								self.state.work_units.last_progress_step = self.state.n_steps
+
+						completion_text = result.long_term_memory or result.extracted_content or "Task marked as done."
+						level = "success" if result.success is not False else "warning"
+						await self._demo_mode_log(
+							completion_text,
+							level,
+							{"action": action_name, "step": self.state.n_steps},
+						)
 
 				results.append(result)
 

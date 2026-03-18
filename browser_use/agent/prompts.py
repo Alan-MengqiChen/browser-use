@@ -124,6 +124,7 @@ class AgentMessagePrompt:
 		llm_screenshot_size: tuple[int, int] | None = None,
 		unavailable_skills_info: str | None = None,
 		plan_description: str | None = None,
+		work_unit_description: str | None = None,
 	):
 		self.browser_state: 'BrowserStateSummary' = browser_state_summary
 		self.file_system: 'FileSystem | None' = file_system
@@ -143,6 +144,7 @@ class AgentMessagePrompt:
 		self.read_state_images = read_state_images or []
 		self.unavailable_skills_info: str | None = unavailable_skills_info
 		self.plan_description: str | None = plan_description
+		self.work_unit_description: str | None = work_unit_description
 		self.llm_screenshot_size = llm_screenshot_size
 		assert self.browser_state
 
@@ -348,7 +350,27 @@ Available tabs:
 		if self.available_file_paths:
 			available_file_paths_text = '\n'.join(self.available_file_paths)
 			agent_state += f'<available_file_paths>{available_file_paths_text}\nUse with absolute paths</available_file_paths>\n'
+		
+		if self.work_unit_description:
+			agent_state += (
+				'<coverage_rules>\n'
+				'If work_unit_state is present, treat the task as a structured coverage task.\n'
+				'Do not finish while pending work units or unresolved candidates remain.\n'
+				'If an active work unit exists, continue working on it unless the scheduler explicitly indicates a switch.\n'
+				'</coverage_rules>\n'
+			)
+
 		return agent_state
+	
+	def _get_work_unit_description(self) -> str:
+		if not self.work_unit_description:
+			return ""
+
+		text = self.work_unit_description.strip()
+		if not text:
+			return ""
+
+		return f"<work_unit_state>\n{text}\n</work_unit_state>\n"
 
 	def _resize_screenshot(self, screenshot_b64: str) -> str:
 		"""Resize screenshot to llm_screenshot_size if configured."""
@@ -397,6 +419,11 @@ Available tabs:
 			+ '\n</agent_history>\n\n'
 		)
 		state_description += '<agent_state>\n' + self._get_agent_state_description().strip('\n') + '\n</agent_state>\n'
+
+		work_unit_text = self._get_work_unit_description()
+		if work_unit_text:
+			state_description += work_unit_text
+
 		state_description += '<browser_state>\n' + self._get_browser_state_description().strip('\n') + '\n</browser_state>\n'
 		# Only add read_state if it has content
 		read_state_description = self.read_state_description.strip('\n').strip() if self.read_state_description else ''

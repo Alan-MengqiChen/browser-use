@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from browser_use.agent.work_unit_models import WorkUnitState
 import hashlib
 import json
 import logging
@@ -255,6 +256,7 @@ class AgentState(BaseModel):
 	agent_id: str = Field(default_factory=uuid7str)
 	n_steps: int = 1
 	consecutive_failures: int = 0
+	work_units: WorkUnitState = Field(default_factory=WorkUnitState)
 	last_result: list[ActionResult] | None = None
 	plan: list[PlanItem] | None = None
 	current_plan_item_index: int = 0

@@ -417,6 +417,7 @@ class MessageManager:
 		unavailable_skills_info: str | None = None,  # Information about skills that cannot be used yet
 		plan_description: str | None = None,  # Rendered plan for injection into agent state
 		skip_state_update: bool = False,
+		work_unit_description: str | None = None,
 	) -> None:
 		"""Create single state message with all content"""
 
@@ -482,6 +483,7 @@ class MessageManager:
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
+			work_unit_description=work_unit_description,
 		).get_user_message(effective_use_vision)
 
 		# Store state message text for history
